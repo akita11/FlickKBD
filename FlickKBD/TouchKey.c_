@@ -1,0 +1,294 @@
+// modified by akita11 for 16bit variables
+/*
+ * Copyright (c) 2020 by Deqing Sun <ds@thinkcreate.us> (c version for CH552 port)
+ * Touch key library for arduino CH552.
+ *
+ * This file is free software; you can redistribute it and/or modify
+ * it under the terms of either the GNU General Public License version 2
+ * or the GNU Lesser General Public License version 2.1, both as
+ * published by the Free Software Foundation.
+ */
+
+
+#include "TouchKey.h"
+
+typedef void (*voidFuncPtr)(void);
+extern __xdata voidFuncPtr touchKeyHandler;
+
+volatile __xdata uint16_t touchRawValue[6];
+volatile __xdata uint16_t touchRawValue0[6];
+volatile __xdata uint8_t touchISRCounter = 0;
+__xdata uint8_t channelEnabled = 0;
+
+__xdata uint8_t touchCounterProcessed = 0;
+__xdata uint8_t processIndex = 0;
+
+__xdata uint8_t touchCycleCounter = 0;
+
+__xdata uint16_t touchBaseline[6];
+__xdata uint8_t touchBaselineNoiseCount[6];
+__xdata uint8_t prevDiffBaselinePos;
+__xdata uint8_t touchNextCalibrateCycleCounter = 0;
+
+__xdata uint16_t touchMaxHalfDelta; //
+__xdata uint8_t touchNoiseHalfDelta;
+__xdata uint8_t touchNoiseCountLimit;
+__xdata uint8_t touchFilterDelayLimit;
+__xdata uint16_t touchThreshold[6]; //
+__xdata uint16_t releaseThreshold[6]; //
+
+__xdata uint8_t touchKeyPressed;
+
+__xdata uint16_t touchStuckCount[6];
+__xdata uint16_t touchStuckLimit;
+
+#pragma save
+#pragma nooverlay
+void TouchKey_ISR_Handler(void){
+    uint8_t index = TKEY_CTRL & 0x07;
+    touchRawValue[index-1]=TKEY_DAT;
+    
+    index++;
+    if (index>6) index = 1;
+    
+    TKEY_CTRL = bTKC_2MS | index;
+    touchISRCounter++;
+
+}
+#pragma restore
+
+
+//TIN0(P1.0), TIN1(P1.1), TIN2(P1.4), TIN3(P1.5), TIN4(P1.6), TIN5(P1.7)
+void TouchKey_begin(uint8_t channelToEnableBitMask){
+    
+    channelEnabled = channelToEnableBitMask;
+    
+    //set IO to input
+    if (channelEnabled & (1<<0)){
+        P1_DIR_PU &= ~(1<<0);
+        P1_MOD_OC &= ~(1<<0);
+    }
+    if (channelEnabled & (1<<1)){
+        P1_DIR_PU &= ~(1<<1);
+        P1_MOD_OC &= ~(1<<1);
+    }
+    if (channelEnabled & (1<<2)){
+        P1_DIR_PU &= ~(1<<4);
+        P1_MOD_OC &= ~(1<<4);
+    }
+    if (channelEnabled & (1<<3)){
+        P1_DIR_PU &= ~(1<<5);
+        P1_MOD_OC &= ~(1<<5);
+    }
+    if (channelEnabled & (1<<4)){
+        P1_DIR_PU &= ~(1<<6);
+        P1_MOD_OC &= ~(1<<6);
+    }
+    if (channelEnabled & (1<<5)){
+        P1_DIR_PU &= ~(1<<7);
+        P1_MOD_OC &= ~(1<<7);
+    }
+    
+    touchMaxHalfDelta = 5;
+    touchNoiseHalfDelta = 2;
+    touchNoiseCountLimit = 10;
+    touchFilterDelayLimit = 5;
+    touchStuckLimit = 500;
+
+    for (uint8_t i = 0; i < 6; i++){
+      touchThreshold[i] = 100;
+      releaseThreshold[i] = 80;
+      touchStuckCount[i] = 0;
+    }
+    
+    touchKeyHandler = TouchKey_ISR_Handler;
+    
+    //sample all channels to prefill baselines
+    for (uint8_t i=0;i<6;i++){
+        TKEY_CTRL = bTKC_2MS | (1+i);
+        while((TKEY_CTRL&bTKC_IF) == 0);
+        touchBaseline[i]=TKEY_DAT;
+    }
+    
+    TKEY_CTRL = bTKC_2MS | 1;
+
+    IE_TKEY = 1;
+
+    // ISRモードで2完全サイクル(12イベント)待機してから baseline を再初期化する。
+    // ポーリング時と ISR 連続スキャン時では TIN5/TIN6 の計測値が大きくずれるため、
+    // ISR 安定後の値で上書きすることで初期ズレを解消する。
+    uint8_t startCount = touchISRCounter;
+    while ((uint8_t)(touchISRCounter - startCount) < 12);
+    uint8_t intOn = EA;
+    EA = 0;
+    for (uint8_t i = 0; i < 6; i++) {
+        if (channelEnabled & (1 << i)) {
+            touchBaseline[i] = touchRawValue[i];
+        }
+    }
+    if (intOn) EA = 1;
+}
+
+uint8_t TouchKey_Process(){ //call this function every 12ms or less.
+  int8_t sampleToProcess = touchISRCounter-touchCounterProcessed;
+  if (sampleToProcess > 0){
+    for (uint8_t i=0;i<sampleToProcess;i++){
+      uint8_t indexBitMask = (1<<processIndex);
+      if (channelEnabled & indexBitMask){                  //Baseline System refered to Freescale MPR121 AN3891
+	uint8_t interruptOn = EA;
+	EA = 0;
+	uint16_t rawData = touchRawValue[processIndex];
+	uint16_t rawData0 = touchRawValue0[processIndex];
+	uint16_t baseData = touchBaseline[processIndex];
+	if (interruptOn) EA = 1;
+	
+	uint16_t diff = 0, mdiff = 0;
+	uint16_t diffR = 0, mdiffR = 0;
+
+	// int_t diff = rawData - touchBaseline[processIndex];
+	
+	if (rawData > baseData) diff = rawData - baseData;
+	else mdiff = baseData - rawData;
+	if (rawData > rawData0) diffR = rawData - rawData0;
+	else mdiffR = rawData0 - rawData;
+	// raw = 1000, base=1200 -> diff=0,   mdiff=200
+	// raw = 1200, base=1000 -> diff=200, mdiff=0
+	
+	//if (touchNextCalibrateCycleCounter == touchCycleCounter){ //similar to case 4, not using average to save some memory on CH552.
+	if (touchNextCalibrateCycleCounter >= touchCycleCounter){ //similar to case 4, not using average to save some memory on CH552.
+	  //USBSerial_print(touchRawValue[0]); USBSerial_print(","); USBSerial_print(touchRawValue0[0]); USBSerial_print(","); USBSerial_print(touchBaseline[0]); USBSerial_print(",");
+	  //USBSerial_print(touchRawValue[1]); USBSerial_print(","); USBSerial_print(touchRawValue0[1]); USBSerial_print(","); USBSerial_print(touchBaseline[1]); USBSerial_print(",");
+	  //USBSerial_println("");
+	  // if ( (diff<touchMaxHalfDelta) && (diff>-touchMaxHalfDelta) ){ //case 1. Small incremental changes to the system represent long term slow (environmental) changes in the system. 
+	  if ( (diff<touchMaxHalfDelta) && (mdiff<touchMaxHalfDelta) ){ //case 1. Small incremental changes to the system represent long term slow (environmental) changes in the system. 
+	  //if ( (diffR<touchMaxHalfDelta) && (mdiffR<touchMaxHalfDelta) ){ //case 1. Small incremental changes to the system represent long term slow (environmental) changes in the system. 
+	    touchBaseline[processIndex] = rawData;
+	  }else{
+	    uint8_t noiseCount;
+	    if (diff>0){ // raw > baseline
+	      if ( (prevDiffBaselinePos&indexBitMask) ){  //same side noise, case 2
+		noiseCount = touchBaselineNoiseCount[processIndex];
+		noiseCount++;
+		if (noiseCount>=touchNoiseCountLimit){
+		  noiseCount = 0;
+		  touchBaseline[processIndex] += touchNoiseHalfDelta;
+		}
+		touchBaselineNoiseCount[processIndex] = noiseCount;
+	      }else{  //different side noise, case 3
+		prevDiffBaselinePos|=indexBitMask;
+		touchBaselineNoiseCount[processIndex] = 1;
+	      }
+	    }else{ // raw < baseline
+	      if ( (prevDiffBaselinePos&indexBitMask)==0 ){  //same side noise, case 2
+		noiseCount = touchBaselineNoiseCount[processIndex];
+		noiseCount++;
+		if (noiseCount>=touchNoiseCountLimit){
+		  noiseCount = 0;
+		  touchBaseline[processIndex] -= touchNoiseHalfDelta;
+		}
+		touchBaselineNoiseCount[processIndex] = noiseCount;
+	      }else{  //different side noise, case 3
+		prevDiffBaselinePos&=~indexBitMask;
+		touchBaselineNoiseCount[processIndex] = 1;
+	      }
+	    }
+	  }
+	}
+	
+	//use 2 threshold to avoid glitching
+	if (touchKeyPressed & indexBitMask){
+	  // if ((-diff)<releaseThreshold){
+	  if (diff > 0) {
+	    // rawがbaselineを上回った: タッチ中にbaselineが下方ドリフトした結果。
+	    // baselineをrawにスナップして即解除し、次回タッチ検出に備える。
+	    touchBaseline[processIndex] = rawData;
+	    touchKeyPressed &= ~indexBitMask;
+	  } else if (mdiff > 0 && mdiff < releaseThreshold[processIndex]){
+	    touchKeyPressed &= ~indexBitMask;
+	  }
+	}else{
+	  //if ((-diff)>touchThreshold){
+	  if (mdiff > touchThreshold[processIndex]){
+	    touchKeyPressed |= indexBitMask;
+	  }
+	}
+
+	// スタックタッチ回復: touchStuckLimit サイクル以上タッチ状態が続いたら
+	// baseline を raw に向けて強制的に大きく移動させ、環境ドリフトに追従する。
+	if (touchKeyPressed & indexBitMask) {
+	  if (touchStuckCount[processIndex] < 0xFFFF) touchStuckCount[processIndex]++;
+	  if (touchStuckCount[processIndex] >= touchStuckLimit) {
+	    uint16_t curBase = touchBaseline[processIndex];
+	    if (curBase > rawData) {
+	      uint16_t stuckMdiff = curBase - rawData;
+	      uint16_t stuckStep = stuckMdiff >> 3;
+	      if (stuckStep < (uint16_t)touchNoiseHalfDelta) stuckStep = (uint16_t)touchNoiseHalfDelta;
+	      if (stuckStep > 50) stuckStep = 50;
+	      touchBaseline[processIndex] = curBase - stuckStep;
+	    }
+	    touchStuckCount[processIndex] = touchStuckLimit;
+	  }
+	} else {
+	  touchStuckCount[processIndex] = 0;
+	}
+      }
+      touchCounterProcessed++;
+      touchRawValue0[processIndex] = touchRawValue[processIndex];
+      processIndex++;
+      if (processIndex>=6){
+	processIndex = 0;
+	//if (touchNextCalibrateCycleCounter == touchCycleCounter){
+	if (touchNextCalibrateCycleCounter >= touchCycleCounter){
+	  touchNextCalibrateCycleCounter = touchCycleCounter + touchFilterDelayLimit;
+	}
+	touchCycleCounter++;
+      }
+    }
+  }
+  return touchCycleCounter;
+}
+
+uint8_t TouchKey_Get(){
+    return touchKeyPressed;
+}
+
+void TouchKey_SetMaxHalfDelta(uint16_t val){
+  //void TouchKey_SetMaxHalfDelta(uint8_t val){
+    touchMaxHalfDelta = val;
+}
+
+void TouchKey_SetNoiseHalfDelta(uint8_t val){
+    touchNoiseHalfDelta = val;
+}
+
+void TouchKey_SetNoiseCountLimit(uint8_t val){
+    touchNoiseCountLimit = val;
+}
+
+void TouchKey_SetFilterDelayLimit(uint8_t val){
+    touchFilterDelayLimit = val;
+}
+
+void TouchKey_SetTouchThreshold(uint16_t val){
+//void TouchKey_SetTouchThreshold(uint8_t val){
+  for (uint8_t i = 0; i < 6; i++){
+    touchThreshold[i] = val;
+  }
+}
+
+void TouchKey_SetReleaseThreshold(uint16_t val){
+//void TouchKey_SetReleaseThreshold(uint8_t val){
+  for (uint8_t i = 0; i < 6; i++){
+    releaseThreshold[i] = val;
+  }
+}
+
+void TouchKey_SetStuckLimit(uint16_t val){
+    touchStuckLimit = val;
+}
+
+void TouchKey_end(void){
+    touchKeyHandler = NULL;
+    TKEY_CTRL = 0;
+    IE_TKEY = 0;
+}
