@@ -24,6 +24,6 @@ void TouchKey_SetNoiseCountLimit(uint8_t val);
 void TouchKey_SetFilterDelayLimit(uint8_t val);
 void TouchKey_SetTouchThreshold(uint16_t val); //
 void TouchKey_SetReleaseThreshold(uint16_t val); //
-void TouchKey_SetStuckLimit(uint16_t val);
+void TouchKey_SetStuckLimit(uint16_t val); // 6ch一括設定。チャンネル別に上書きする場合はtouchStuckLimit[]を直接書き換える
 
 #endif

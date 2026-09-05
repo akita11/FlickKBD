@@ -1,11 +1,7 @@
-// ソースコードの準備：
-// - CH55xduinoをインストール https://github.com/DeqingSun/ch55xduino
-// - TouchKey.{c_,h_}を、システムのArduinoフォルダ内のCH55xduinoのlibraries/TouchKey/src に、TouchKey.{c,h}として移動（オリジナルをバックアップの上でコピー）
-
-#define DEV_R // for 1st CH552 (U2), with LED
-//#define USBKBD
+//#define DEV_R // for 1st CH552 (U2), with LED
+#define USBKBD
 // when building without USBKBD defined, src/userUsbHidKeyboard must be moved outside the Sketch folder.
-#define DEBUG // for touch parameter tuning
+//#define DEBUG // for touch parameter tuning
 
 #include <TouchKey.h>
 
@@ -23,7 +19,7 @@ void setLED(uint8_t r, uint8_t g, uint8_t b){
 #define MODE_ALPHA 1
 #define MODE_NUM   2
 uint8_t charMode = MODE_KANA;
-// アルファベットモード:大文字(1)/小文字(0)、かなモード:通常(1)/小文字モード(0)
+// アルファベットモード:大文字(1)/小文字(0)、かなモード:通常(1い)/小文字モード(0)
 // (どちらもC0/R3で切替、LEDは明(1)/暗(0))
 uint8_t altKeyUpper = 1;
 
@@ -123,6 +119,7 @@ extern __xdata uint16_t touchBaseline[];
 extern __xdata uint16_t touchMaxHalfDelta;
 extern __xdata uint16_t touchThreshold[6];
 extern __xdata uint16_t releaseThreshold[6];
+extern __xdata uint16_t touchStuckLimit[6];
 extern __xdata uint8_t touchNextCalibrateCycleCounter;
 extern __xdata uint8_t touchCycleCounter;
 
@@ -174,6 +171,16 @@ void setup() {
   TouchKey_SetFilterDelayLimit(5);  //FDL=5, make overall adjustment slower
   TouchKey_SetTouchThreshold(250);  //100, Bigger touch pad can use a bigger value
   TouchKey_SetReleaseThreshold(240); //80, Smaller than touch threshold
+  // 実測の結果、実タッチ振幅(約750-950)はドリフトのピーク(約900-2800、
+  // セッションにより変動)と分離できないと判明。XE/YEは単独でキー押下に
+  // ならない(下のCOLY/ROWX単独ガード)ため、方針転換: しきい値は他chと同じ
+  // 250/240のまま(=検出漏れを避けるため実タッチ振幅より十分低く保つ)、
+  // 誤検出(触れていなくても検出)は許容する。
+  // スタックタッチ回復だけXE/YEを早める(デフォルト500サイクル≒5-6秒
+  // -> 約40サイクル≒0.4秒)ことで、ドリフトによる「触れっぱなし」状態を
+  // 短時間で自動的に解消する。ch0-3は変更しない。
+  touchStuckLimit[4] = 40;
+  touchStuckLimit[5] = 40;
 #else
   // for DEV_U
 /*
@@ -193,6 +200,16 @@ void setup() {
   TouchKey_SetFilterDelayLimit(5);  //5, make overall adjustment slower
   TouchKey_SetTouchThreshold(250);  //100, Bigger touch pad can use a bigger value
   TouchKey_SetReleaseThreshold(240); //80, Smaller than touch threshold
+  // 実測の結果、実タッチ振幅(約750-950)はドリフトのピーク(約900-2800、
+  // セッションにより変動)と分離できないと判明。XE/YEは単独でキー押下に
+  // ならない(下のCOLY/ROWX単独ガード)ため、方針転換: しきい値は他chと同じ
+  // 250/240のまま(=検出漏れを避けるため実タッチ振幅より十分低く保つ)、
+  // 誤検出(触れていなくても検出)は許容する。
+  // スタックタッチ回復だけXE/YEを早める(デフォルト500サイクル≒5-6秒
+  // -> 約40サイクル≒0.4秒)ことで、ドリフトによる「触れっぱなし」状態を
+  // 短時間で自動的に解消する。ch0-3は変更しない。
+  touchStuckLimit[4] = 40;
+  touchStuckLimit[5] = 40;
 #endif
 
   Serial0_begin(9600);
@@ -361,7 +378,12 @@ void loop() {
 // Cp : アルファベットモードの Upper/Lower Case 切替 (LED明:大文字/暗:小文字)
 // ?. : 押す/左/上/右フリックの順に , . ? !
 
-  if (st == 0 && cntC == 1 && cntR == 1){
+  // COLY/ROWXは実キーに隣接するフリック検出専用の仮想エッジセンサーであり、
+  // これ単独(COLYのみ/ROWXのみ)でのタッチ開始は無視する。
+  // XE/YEチャンネルのドリフトでCOLYとROWXが同時に誤検出されたとき、
+  // 実キーではないのにC0R0(あ)扱いされてしまう誤動作を防ぐ。
+  if (st == 0 && cntC == 1 && cntR == 1 &&
+      (touch_c & COLALL) != COLY && (touch_c & ROWALL) != ROWX){
     st = 1;
     switch(touch_c & COLALL){
       case COL0 : key1stC = 0; break;

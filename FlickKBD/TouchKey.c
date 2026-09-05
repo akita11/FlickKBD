@@ -40,7 +40,7 @@ __xdata uint16_t releaseThreshold[6]; //
 __xdata uint8_t touchKeyPressed;
 
 __xdata uint16_t touchStuckCount[6];
-__xdata uint16_t touchStuckLimit;
+__xdata uint16_t touchStuckLimit[6]; // チャンネル別。TouchKey_begin()で全ch500に初期化、必要ならスケッチ側から直接上書き可
 
 #pragma save
 #pragma nooverlay
@@ -93,12 +93,12 @@ void TouchKey_begin(uint8_t channelToEnableBitMask){
     touchNoiseHalfDelta = 2;
     touchNoiseCountLimit = 10;
     touchFilterDelayLimit = 5;
-    touchStuckLimit = 500;
 
     for (uint8_t i = 0; i < 6; i++){
       touchThreshold[i] = 100;
       releaseThreshold[i] = 80;
       touchStuckCount[i] = 0;
+      touchStuckLimit[i] = 500;
     }
     
     touchKeyHandler = TouchKey_ISR_Handler;
@@ -217,7 +217,7 @@ uint8_t TouchKey_Process(){ //call this function every 12ms or less.
 	// baseline を raw に向けて強制的に大きく移動させ、環境ドリフトに追従する。
 	if (touchKeyPressed & indexBitMask) {
 	  if (touchStuckCount[processIndex] < 0xFFFF) touchStuckCount[processIndex]++;
-	  if (touchStuckCount[processIndex] >= touchStuckLimit) {
+	  if (touchStuckCount[processIndex] >= touchStuckLimit[processIndex]) {
 	    uint16_t curBase = touchBaseline[processIndex];
 	    if (curBase > rawData) {
 	      uint16_t stuckMdiff = curBase - rawData;
@@ -226,7 +226,7 @@ uint8_t TouchKey_Process(){ //call this function every 12ms or less.
 	      if (stuckStep > 50) stuckStep = 50;
 	      touchBaseline[processIndex] = curBase - stuckStep;
 	    }
-	    touchStuckCount[processIndex] = touchStuckLimit;
+	    touchStuckCount[processIndex] = touchStuckLimit[processIndex];
 	  }
 	} else {
 	  touchStuckCount[processIndex] = 0;
@@ -284,7 +284,9 @@ void TouchKey_SetReleaseThreshold(uint16_t val){
 }
 
 void TouchKey_SetStuckLimit(uint16_t val){
-    touchStuckLimit = val;
+  for (uint8_t i = 0; i < 6; i++){
+    touchStuckLimit[i] = val;
+  }
 }
 
 void TouchKey_end(void){
